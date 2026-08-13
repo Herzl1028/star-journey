@@ -417,6 +417,7 @@ export class Starfield {
       lastX = e.clientX;
       lastY = e.clientY;
       dragDist = 0;
+      this._hover(e.clientX, e.clientY); // 按下即命中，手机端无 hover 也能选到
     });
     window.addEventListener('pointermove', (e) => {
       if (dragging) {
@@ -431,9 +432,10 @@ export class Starfield {
         this._hover(e.clientX, e.clientY);
       }
     });
-    window.addEventListener('pointerup', () => {
-      if (dragging && dragDist < 5 && this.targetId) {
-        this.onSelectPhoto(this.targetId);
+    window.addEventListener('pointerup', (e) => {
+      if (dragging && dragDist < 12) {
+        this._hover(e.clientX, e.clientY); // 用抬起位置重新命中，容忍手指微移
+        if (this.targetId) this.onSelectPhoto(this.targetId);
       }
       dragging = false;
     });
@@ -441,7 +443,7 @@ export class Starfield {
 
   _hover(x, y) {
     let best = null;
-    let bestD = 26 * 26;
+    let bestD = 40 * 40;
     for (const [id, p] of this.projections) {
       if (p.behind) continue;
       const d = (p.x - x) * (p.x - x) + (p.y - y) * (p.y - y);
