@@ -1,19 +1,18 @@
 // ============================================================
 //  数据访问层：腾讯云开发 CloudBase（国内直连）。
-//  - 照片元数据存文档数据库 photos 集合
-//  - 图片文件存云存储 photos/ 目录（数据库里存 fileID，读取时换临时链接）
+//  - 照片元数据存 SQL 型数据库（MySQL）photos 表
+//  - 图片文件存云存储 photos/ 目录（表里存 fileID，读取时换临时链接）
 //  接口保持 fetchPhotos / uploadPhoto / deletePhoto 不变，UI 无需改动。
 // ============================================================
 
 import { uid, makeDemoImage } from './utils.js';
 
 const ENV_ID = 'star-journey-d4g9eulgn1ef88daa';
-const COLLECTION = 'photos';
 const STORAGE_DIR = 'photos/';
 
-const app = globalThis.cloudbase.init({ env: ENV_ID }); // 环境地域若不是上海，改为 init({ env: ENV_ID, region: 'ap-guangzhou' })
+const app = globalThis.cloudbase.init({ env: ENV_ID });
 const auth = app.auth();
-const db = app.database();
+const db = app.rdb(); // 关系型数据库（MySQL）
 
 // ---------- 匿名登录（幂等，兼容新旧 SDK 写法） ----------
 let loginPromise;
@@ -32,6 +31,32 @@ async function doLogin() {
     return;
   }
   throw new Error('当前 SDK 不支持匿名登录');
+}
+
+// ---------- 字段映射：数据库 snake_case ↔ 前端 camelCase ----------
+function rowToPhoto(r) {
+  return {
+    id: r.id,
+    title: r.title || '',
+    description: r.description || '',
+    location: r.location || '',
+    takenAt: r.taken_at || '',
+    author: r.author || '旅行者',
+    imageUrl: r.image_url || '',
+    createdAt: r.created_at || '',
+  };
+}
+
+function photoToRow(p) {
+  return {
+    id: p.id,
+    title: p.title,
+    description: p.description || '',
+    location: p.location || '',
+    taken_at: p.takenAt || null,
+    author: p.author || '旅行者',
+    image_url: p.imageUrl,
+  };
 }
 
 // ---------- 图片：dataURL → File → 云存储 ----------
@@ -65,24 +90,6 @@ async function resolveUrls(list) {
   }
 }
 
-function docToPhoto(d) {
-  return {
-    id: d._id || d.id,
-    title: d.title || '',
-    description: d.description || '',
-    location: d.location || '',
-    takenAt: d.takenAt || '',
-    author: d.author || '旅行者',
-    imageUrl: d.imageUrl || '',
-    createdAt: d.createdAt || '',
-  };
-}
-
-function unwrapList(res) {
-  const arr = res && res.data ? res.data : Array.isArray(res) ? res : [];
-  return arr || [];
-}
-
 // ---------- 演示数据（首次为空时写入云端） ----------
 const DEMO = [
   { title: '冰岛的极光之夜', description: '在雷克雅未克郊外，等到了整片天空的绿色极光。', location: '冰岛 · 雷克雅未克', takenAt: '2026-01-12', from: '#1a2a6c', to: '#0f4c5c', accent: '#7fe3ff' },
@@ -101,22 +108,27 @@ function demoPhotos() {
     takenAt: d.takenAt,
     author: '旅行者',
     imageUrl: makeDemoImage(d.title, d.from, d.to, d.accent),
-    createdAt: new Date().toISOString(),
   }));
 }
 
 async function seedIfEmpty() {
-  let i = 1;
   for (const d of demoPhotos()) {
-    const fileId = await uploadImage(d.imageUrl, 'demo-' + i + '.jpg');
-    await db.collection(COLLECTION).add({ ...d, imageUrl: fileId });
-    i++;
+    const id = uid();
+    const fileId = await uploadImage(d.imageUrl, 'demo-' + id + '.jpg');
+    const { error } = await db
+      .from('photos')
+      .insert(photoToRow({ ...d, id, imageUrl: fileId }));
+    if (error) throw new Error('初始化失败：' + (error.message || error));
   }
 }
 
 async function queryAll() {
-  const res = await db.collection(COLLECTION).orderBy('createdAt', 'desc').get();
-  return unwrapList(res).map(docToPhoto);
+  const { data, error } = await db
+    .from('photos')
+    .select('*')
+    .order('created_at', { ascending: false });
+  if (error) throw new Error(error.message || error);
+  return (data || []).map(rowToPhoto);
 }
 
 export const PhotoService = {
@@ -143,8 +155,10 @@ export const PhotoService = {
   // 上传一张照片，返回完整 Photo 对象
   async uploadPhoto(input) {
     await ensureLogin();
-    const fileId = await uploadImage(input.imageUrl, uid() + '.jpg');
-    const doc = {
+    const id = uid();
+    const fileId = await uploadImage(input.imageUrl, id + '.jpg');
+    const photo = {
+      id,
       title: input.title,
       description: input.description || '',
       location: input.location || '',
@@ -153,9 +167,8 @@ export const PhotoService = {
       imageUrl: fileId,
       createdAt: new Date().toISOString(),
     };
-    const res = await db.collection(COLLECTION).add(doc);
-    const id = (res && (res.id || res._id)) || '';
-    const photo = docToPhoto({ _id: id, ...doc });
+    const { error } = await db.from('photos').insert(photoToRow(photo));
+    if (error) throw new Error('上传失败：' + (error.message || error));
     const [resolved] = await resolveUrls([photo]);
     return resolved;
   },
@@ -164,13 +177,12 @@ export const PhotoService = {
   async deletePhoto(id) {
     await ensureLogin();
     try {
-      const d = await db.collection(COLLECTION).doc(id).get();
-      const data = d && d.data ? d.data : d;
-      if (data && data.imageUrl) {
-        await app.deleteFile({ fileList: [data.imageUrl] });
+      const { data } = await db.from('photos').select('image_url').eq('id', id).single();
+      if (data && data.image_url) {
+        await app.deleteFile({ fileList: [data.image_url] });
       }
     } catch (e) {}
-    await db.collection(COLLECTION).doc(id).remove();
+    await db.from('photos').delete().eq('id', id);
     return resolveUrls(await queryAll());
   },
 };
