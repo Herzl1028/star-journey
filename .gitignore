@@ -1,0 +1,17 @@
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor
+.vscode/
+.idea/
+
+# Node (预留，当前无构建)
+node_modules/
+
+# Vercel
+.vercel/
+
+# Logs
+*.log
