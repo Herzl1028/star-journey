@@ -1,11 +1,11 @@
 // ============================================================
 //  数据访问层：Supabase 云端共享。
-//  - 照片元数据存 public.photos 表
+//  - 照片元数据存 public.photos 表（适配已有表结构，id 由数据库生成）
 //  - 图片文件存 Storage bucket "photos"（公开读）
 //  接口保持 fetchPhotos / uploadPhoto / deletePhoto 不变，UI 无需改动。
 // ============================================================
 
-import { uid, randomStarPosition, makeDemoImage } from './utils.js';
+import { uid, makeDemoImage } from './utils.js';
 
 // ↓↓↓ Supabase 项目信息 ↓↓↓
 const SUPABASE_URL = 'https://andruockdigegygqgnqj.supabase.co';
@@ -19,27 +19,24 @@ const supabase = globalThis.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KE
 function rowToPhoto(r) {
   return {
     id: r.id,
-    title: r.title,
-    description: r.description || '',
+    title: r.title || '',
+    description: r.ai_description || '',
     location: r.location || '',
     takenAt: r.taken_at || '',
     author: r.author || '旅行者',
     imageUrl: r.image_url,
-    starPosition: r.star_position || { x: 0, y: 0, z: 0 },
     createdAt: r.created_at,
   };
 }
 
 function photoToRow(p) {
   return {
-    id: p.id,
     title: p.title,
-    description: p.description || '',
+    ai_description: p.description || '',
     location: p.location || '',
     taken_at: p.takenAt || null,
     author: p.author || '旅行者',
     image_url: p.imageUrl,
-    star_position: p.starPosition,
   };
 }
 
@@ -59,7 +56,7 @@ async function uploadImage(dataUrl, filename) {
   return supabase.storage.from(BUCKET).getPublicUrl(filename).data.publicUrl;
 }
 
-// ---------- 演示数据（首次为空时写入云端，固定 id 幂等，避免并发重复） ----------
+// ---------- 演示数据（首次为空时写入云端） ----------
 const DEMO = [
   { title: '冰岛的极光之夜', description: '在雷克雅未克郊外，等到了整片天空的绿色极光。', location: '冰岛 · 雷克雅未克', takenAt: '2026-01-12', from: '#1a2a6c', to: '#0f4c5c', accent: '#7fe3ff' },
   { title: '富士山的黎明', description: '清晨五点的富士山，山顶被染成了粉色。', location: '日本 · 山梨县', takenAt: '2026-02-03', from: '#2c3e50', to: '#e96443', accent: '#ffb0d0' },
@@ -70,16 +67,13 @@ const DEMO = [
 ];
 
 function demoPhotos() {
-  return DEMO.map((d, i) => ({
-    id: 'demo-' + (i + 1),
+  return DEMO.map((d) => ({
     title: d.title,
     description: d.description,
     location: d.location,
     takenAt: d.takenAt,
     author: '旅行者',
     imageUrl: makeDemoImage(d.title, d.from, d.to, d.accent),
-    starPosition: randomStarPosition(),
-    createdAt: new Date().toISOString(),
   }));
 }
 
@@ -89,12 +83,14 @@ async function seedIfEmpty() {
     .select('*', { count: 'exact', head: true });
   if (error) throw new Error('读取失败：' + error.message);
   if (count && count > 0) return;
+  let i = 1;
   for (const d of demoPhotos()) {
-    const url = await uploadImage(d.imageUrl, d.id + '.jpg');
+    const url = await uploadImage(d.imageUrl, 'demo-' + i + '.jpg');
     const { error: e } = await supabase
       .from('photos')
-      .upsert(photoToRow({ ...d, imageUrl: url }), { onConflict: 'id' });
+      .insert(photoToRow({ ...d, imageUrl: url }));
     if (e) throw new Error('初始化失败：' + e.message);
+    i++;
   }
 }
 
@@ -114,15 +110,16 @@ export const PhotoService = {
     return (data || []).map(rowToPhoto);
   },
 
-  // 上传一张照片，返回完整 Photo 对象
+  // 上传一张照片，返回完整 Photo 对象（id 由数据库生成）
   async uploadPhoto(input) {
-    const photo = { id: uid(), createdAt: new Date().toISOString(), ...input };
-    const url = await uploadImage(photo.imageUrl, photo.id + '.jpg');
-    const { error } = await supabase
+    const url = await uploadImage(input.imageUrl, uid() + '.jpg');
+    const { data, error } = await supabase
       .from('photos')
-      .insert(photoToRow({ ...photo, imageUrl: url }));
+      .insert(photoToRow({ ...input, imageUrl: url }))
+      .select()
+      .single();
     if (error) throw new Error('上传失败：' + error.message);
-    return { ...photo, imageUrl: url };
+    return rowToPhoto(data);
   },
 
   // 删除照片，返回更新后的列表
