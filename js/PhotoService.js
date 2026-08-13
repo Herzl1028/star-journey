@@ -1,59 +1,86 @@
 // ============================================================
-//  数据访问层：Supabase 云端共享。
-//  - 照片元数据存 public.photos 表（适配已有表结构，id 由数据库生成）
-//  - 图片文件存 Storage bucket "photos"（公开读）
+//  数据访问层：腾讯云开发 CloudBase（国内直连）。
+//  - 照片元数据存文档数据库 photos 集合
+//  - 图片文件存云存储 photos/ 目录（数据库里存 fileID，读取时换临时链接）
 //  接口保持 fetchPhotos / uploadPhoto / deletePhoto 不变，UI 无需改动。
 // ============================================================
 
 import { uid, makeDemoImage } from './utils.js';
 
-// ↓↓↓ Supabase 项目信息 ↓↓↓
-const SUPABASE_URL = 'https://andruockdigegygqgnqj.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFuZHJ1b2NrZGlnZWd5Z3FnbnFqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY0OTg0ODcsImV4cCI6MjEwMjA3NDQ4N30.uyNt8WEA5_v8lhxMwbtP6edpcYjDCLEg-I6J9rAaVGM';
-const BUCKET = 'photos';
-// ↑↑↑
+const ENV_ID = 'star-journey-d4g9eulgn1ef88daa';
+const COLLECTION = 'photos';
+const STORAGE_DIR = 'photos/';
 
-const supabase = globalThis.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const app = globalThis.cloudbase.init({ env: ENV_ID }); // 环境地域若不是上海，改为 init({ env: ENV_ID, region: 'ap-guangzhou' })
+const auth = app.auth();
+const db = app.database();
 
-// ---------- 字段映射：数据库 snake_case ↔ 前端 camelCase ----------
-function rowToPhoto(r) {
-  return {
-    id: r.id,
-    title: r.title || '',
-    description: r.ai_description || '',
-    location: r.location || '',
-    takenAt: r.taken_at || '',
-    author: r.author || '旅行者',
-    imageUrl: r.image_url,
-    createdAt: r.created_at,
-  };
+// ---------- 匿名登录（幂等，兼容新旧 SDK 写法） ----------
+let loginPromise;
+function ensureLogin() {
+  if (!loginPromise) loginPromise = doLogin();
+  return loginPromise;
+}
+async function doLogin() {
+  if (typeof auth.signInAnonymously === 'function') {
+    const r = await auth.signInAnonymously();
+    if (r && r.error) throw new Error('登录失败：' + (r.error.message || r.error));
+    return;
+  }
+  if (typeof auth.anonymousAuthProvider === 'function') {
+    await auth.anonymousAuthProvider().signIn();
+    return;
+  }
+  throw new Error('当前 SDK 不支持匿名登录');
 }
 
-function photoToRow(p) {
-  return {
-    title: p.title,
-    ai_description: p.description || '',
-    location: p.location || '',
-    taken_at: p.takenAt || null,
-    author: p.author || '旅行者',
-    image_url: p.imageUrl,
-  };
-}
-
-// ---------- 图片：dataURL → Storage → 公开 URL ----------
-async function dataUrlToBlob(dataUrl) {
-  const res = await fetch(dataUrl);
-  return res.blob();
+// ---------- 图片：dataURL → File → 云存储 ----------
+function dataUrlToFile(dataUrl, filename) {
+  const m = dataUrl.match(/^data:(.*?);base64,(.*)$/);
+  if (!m) throw new Error('图片数据格式错误');
+  const mime = m[1] || 'image/jpeg';
+  const bin = atob(m[2]);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new File([arr], filename, { type: mime });
 }
 
 async function uploadImage(dataUrl, filename) {
-  const blob = await dataUrlToBlob(dataUrl);
-  const { error } = await supabase.storage.from(BUCKET).upload(filename, blob, {
-    contentType: 'image/jpeg',
-    upsert: true,
-  });
-  if (error) throw new Error('图片上传失败：' + error.message);
-  return supabase.storage.from(BUCKET).getPublicUrl(filename).data.publicUrl;
+  const file = dataUrlToFile(dataUrl, filename);
+  const res = await app.uploadFile({ cloudPath: STORAGE_DIR + filename, filePath: file });
+  return res.fileID; // cloud://...
+}
+
+// fileID 批量换临时链接（供 img.src 直接显示）
+async function resolveUrls(list) {
+  const ids = list.map((p) => p.imageUrl).filter(Boolean);
+  if (!ids.length) return list;
+  try {
+    const res = await app.getTempFileURL({ fileList: ids });
+    const map = {};
+    for (const it of res.fileList || []) map[it.fileID] = it.tempFileURL;
+    return list.map((p) => ({ ...p, imageUrl: map[p.imageUrl] || p.imageUrl }));
+  } catch {
+    return list;
+  }
+}
+
+function docToPhoto(d) {
+  return {
+    id: d._id || d.id,
+    title: d.title || '',
+    description: d.description || '',
+    location: d.location || '',
+    takenAt: d.takenAt || '',
+    author: d.author || '旅行者',
+    imageUrl: d.imageUrl || '',
+    createdAt: d.createdAt || '',
+  };
+}
+
+function unwrapList(res) {
+  const arr = res && res.data ? res.data : Array.isArray(res) ? res : [];
+  return arr || [];
 }
 
 // ---------- 演示数据（首次为空时写入云端） ----------
@@ -74,74 +101,76 @@ function demoPhotos() {
     takenAt: d.takenAt,
     author: '旅行者',
     imageUrl: makeDemoImage(d.title, d.from, d.to, d.accent),
+    createdAt: new Date().toISOString(),
   }));
 }
 
 async function seedIfEmpty() {
-  const { count, error } = await supabase
-    .from('photos')
-    .select('*', { count: 'exact', head: true });
-  if (error) throw new Error('读取失败：' + error.message);
-  if (count && count > 0) return;
   let i = 1;
   for (const d of demoPhotos()) {
-    const url = await uploadImage(d.imageUrl, 'demo-' + i + '.jpg');
-    const { error: e } = await supabase
-      .from('photos')
-      .insert(photoToRow({ ...d, imageUrl: url }));
-    if (e) throw new Error('初始化失败：' + e.message);
+    const fileId = await uploadImage(d.imageUrl, 'demo-' + i + '.jpg');
+    await db.collection(COLLECTION).add({ ...d, imageUrl: fileId });
     i++;
   }
+}
+
+async function queryAll() {
+  const res = await db.collection(COLLECTION).orderBy('createdAt', 'desc').get();
+  return unwrapList(res).map(docToPhoto);
 }
 
 export const PhotoService = {
   // 拉取全部照片（首次为空时写入演示数据）
   async fetchPhotos() {
-    const { count, error: cErr } = await supabase
-      .from('photos')
-      .select('*', { count: 'exact', head: true });
-    if (cErr) throw new Error('连接失败：' + cErr.message);
-    if (!count) await seedIfEmpty();
-    const { data, error } = await supabase
-      .from('photos')
-      .select('*')
-      .order('created_at', { ascending: false });
-    if (error) throw new Error('读取失败：' + error.message);
-    return (data || []).map(rowToPhoto);
+    await ensureLogin();
+    let photos = [];
+    try {
+      photos = await queryAll();
+    } catch (e) {
+      throw new Error('读取失败：' + (e.message || e));
+    }
+    if (!photos.length) {
+      try {
+        await seedIfEmpty();
+        photos = await queryAll();
+      } catch (e) {
+        throw new Error('初始化失败：' + (e.message || e));
+      }
+    }
+    return resolveUrls(photos);
   },
 
-  // 上传一张照片，返回完整 Photo 对象（id 由数据库生成）
+  // 上传一张照片，返回完整 Photo 对象
   async uploadPhoto(input) {
-    const url = await uploadImage(input.imageUrl, uid() + '.jpg');
-    const { data, error } = await supabase
-      .from('photos')
-      .insert(photoToRow({ ...input, imageUrl: url }))
-      .select()
-      .single();
-    if (error) throw new Error('上传失败：' + error.message);
-    return rowToPhoto(data);
+    await ensureLogin();
+    const fileId = await uploadImage(input.imageUrl, uid() + '.jpg');
+    const doc = {
+      title: input.title,
+      description: input.description || '',
+      location: input.location || '',
+      takenAt: input.takenAt || '',
+      author: input.author || '旅行者',
+      imageUrl: fileId,
+      createdAt: new Date().toISOString(),
+    };
+    const res = await db.collection(COLLECTION).add(doc);
+    const id = (res && (res.id || res._id)) || '';
+    const photo = docToPhoto({ _id: id, ...doc });
+    const [resolved] = await resolveUrls([photo]);
+    return resolved;
   },
 
   // 删除照片，返回更新后的列表
   async deletePhoto(id) {
-    const { data: row } = await supabase
-      .from('photos')
-      .select('image_url')
-      .eq('id', id)
-      .single();
-    const { error } = await supabase.from('photos').delete().eq('id', id);
-    if (error) throw new Error('删除失败：' + error.message);
-    if (row && row.image_url) {
-      try {
-        const name = row.image_url.split('/').pop();
-        await supabase.storage.from(BUCKET).remove([name]);
-      } catch {}
-    }
-    const { data, error: rErr } = await supabase
-      .from('photos')
-      .select('*')
-      .order('created_at', { ascending: false });
-    if (rErr) throw new Error('读取失败：' + rErr.message);
-    return (data || []).map(rowToPhoto);
+    await ensureLogin();
+    try {
+      const d = await db.collection(COLLECTION).doc(id).get();
+      const data = d && d.data ? d.data : d;
+      if (data && data.imageUrl) {
+        await app.deleteFile({ fileList: [data.imageUrl] });
+      }
+    } catch (e) {}
+    await db.collection(COLLECTION).doc(id).remove();
+    return resolveUrls(await queryAll());
   },
 };
